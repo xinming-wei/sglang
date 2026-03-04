@@ -511,11 +511,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
 
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
-            output = hidden_states
-        else:
-            raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
-
+        output = hidden_states
         previous_event = Buffer.capture() if self.async_finish else None
         return output, previous_event
 

@@ -4,6 +4,8 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
+import torch.nn.functional as F
+import triton
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
@@ -34,7 +36,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
-from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu, is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -228,6 +230,8 @@ class DeepEPMoE(FusedMoE):
         elif DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             if self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8(dispatch_output)
+            elif not self.use_fp8_w8a8:
+                output = self.forward_deepep_normal_bf16(dispatch_output)
             else:
                 assert False, "forward_deepgemm_contiguous is deprecated"
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
@@ -238,6 +242,8 @@ class DeepEPMoE(FusedMoE):
                 output = self.forward_flashinfer_cutedsl(dispatch_output)
             elif self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8_masked(dispatch_output)
+            elif not self.use_fp8_w8a8:
+                output = self.forward_deepep_ll_bf16(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
 
@@ -314,6 +320,179 @@ class DeepEPMoE(FusedMoE):
             masked_m=masked_m,
             moe_runner_config=self.moe_runner_config,
         )
+        return output
+
+    def forward_deepep_normal_bf16(
+        self,
+        dispatch_output: DeepEPNormalDispatchOutput,
+    ):
+        """BF16 MoE forward for DeepEP normal mode.
+
+        Scatters tokens by expert, runs per-expert BF16 GEMMs with activation,
+        then gathers results back with routing weights applied.
+        """
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            deepep_permute_triton_kernel,
+            deepep_post_reorder_triton_kernel,
+            deepep_run_moe_deep_preprocess,
+        )
+
+        (
+            hidden_states,
+            _hidden_states_scale,
+            topk_ids,
+            topk_weights,
+            num_recv_tokens_per_expert,
+        ) = dispatch_output
+
+        num_tokens = hidden_states.shape[0]
+        if num_tokens == 0:
+            return hidden_states
+
+        hidden_size = hidden_states.shape[1]
+        top_k = topk_ids.shape[1]
+
+        reorder_topk_ids, src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
+            topk_ids, self.num_local_experts
+        )
+
+        num_valid_tokens = int(seg_indptr[self.num_local_experts].item())
+        if num_valid_tokens == 0:
+            return torch.zeros(
+                (num_tokens, hidden_size),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+
+        gateup_input = torch.empty(
+            (num_valid_tokens, hidden_size),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+        BLOCK_SIZE = min(triton.next_power_of_2(hidden_size), 1024)
+        deepep_permute_triton_kernel[(num_tokens,)](
+            hidden_states,
+            gateup_input,
+            src2dst,
+            topk_ids,
+            topk_ids,  # dummy pointer for unused a1_scales_ptr
+            top_k,
+            hidden_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+
+        intermediate_size = self.w2_weight.shape[2]
+        down_output = torch.empty(
+            (num_valid_tokens, hidden_size),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+        _is_cuda_device = is_cuda()
+        if _is_cuda_device:
+            from sgl_kernel import silu_and_mul as _silu_and_mul
+
+        for expert_id in range(self.num_local_experts):
+            start = int(seg_indptr[expert_id].item())
+            end = int(seg_indptr[expert_id + 1].item())
+            if start == end:
+                continue
+
+            expert_input = gateup_input[start:end]
+            gate_up = torch.mm(
+                expert_input, self.w13_weight[expert_id].t()
+            )
+
+            if _is_cuda_device:
+                intermediate = torch.empty(
+                    (end - start, intermediate_size),
+                    device=gate_up.device,
+                    dtype=gate_up.dtype,
+                )
+                _silu_and_mul(gate_up, intermediate)
+            else:
+                gate, up = gate_up.chunk(2, dim=-1)
+                intermediate = F.silu(gate) * up
+
+            down_output[start:end] = torch.mm(
+                intermediate, self.w2_weight[expert_id].t()
+            )
+
+        output = torch.zeros(
+            (num_tokens, hidden_size),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        deepep_post_reorder_triton_kernel[(num_tokens,)](
+            down_output,
+            output,
+            src2dst,
+            topk_ids,
+            topk_weights,
+            top_k,
+            hidden_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+
+        return output
+
+    def forward_deepep_ll_bf16(
+        self,
+        dispatch_output: DeepEPLLDispatchOutput,
+    ):
+        """BF16 MoE forward for DeepEP low-latency mode.
+
+        The LL dispatch produces a [num_experts, max_tokens, hidden_size] layout
+        with masked_m indicating actual token counts per expert.
+        """
+        (
+            hidden_states,
+            _hidden_states_scale,
+            topk_ids,
+            topk_weights,
+            masked_m,
+            expected_m,
+        ) = dispatch_output
+
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+
+        num_experts = self.num_local_experts
+        hidden_size = hidden_states.shape[-1]
+        intermediate_size = self.w2_weight.shape[2]
+
+        _is_cuda_device = is_cuda()
+        if _is_cuda_device:
+            from sgl_kernel import silu_and_mul as _silu_and_mul
+
+        output = torch.zeros_like(hidden_states)
+
+        for expert_id in range(num_experts):
+            count = int(masked_m[expert_id].item())
+            if count == 0:
+                continue
+
+            expert_input = hidden_states[expert_id, :count]
+            gate_up = torch.mm(
+                expert_input, self.w13_weight[expert_id].t()
+            )
+
+            if _is_cuda_device:
+                intermediate = torch.empty(
+                    (count, intermediate_size),
+                    device=gate_up.device,
+                    dtype=gate_up.dtype,
+                )
+                _silu_and_mul(gate_up, intermediate)
+            else:
+                gate, up = gate_up.chunk(2, dim=-1)
+                intermediate = F.silu(gate) * up
+
+            output[expert_id, :count] = torch.mm(
+                intermediate, self.w2_weight[expert_id].t()
+            )
+
         return output
 
     def forward_cutlass_w4afp8(
