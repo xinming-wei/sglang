@@ -64,6 +64,41 @@ if _is_npu:
     import torch_npu
 
 
+_expert_load_logger_cached = None
+
+
+def _maybe_log_expert_load(moe_layer, dispatch_output):
+    """Record expert loads with zero overhead when disabled."""
+    global _expert_load_logger_cached
+    if _expert_load_logger_cached is None:
+        from sglang.srt.layers.moe.expert_load_logger import ExpertLoadLogger
+
+        _expert_load_logger_cached = ExpertLoadLogger.get()
+    ell = _expert_load_logger_cached
+    if not ell.enabled:
+        return
+
+    from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+    if not DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+        return
+
+    ell.init_tensors(
+        num_local_experts=moe_layer.num_local_experts,
+        ep_rank=moe_layer.moe_ep_rank,
+        ep_size=moe_layer.moe_ep_size,
+        global_rank=(
+            torch.distributed.get_rank()
+            if torch.distributed.is_initialized()
+            else 0
+        ),
+    )
+    ell.record(
+        layer_id=moe_layer.layer_id,
+        num_recv_tokens_per_expert=dispatch_output.num_recv_tokens_per_expert,
+    )
+
+
 class DeepEPMoE(FusedMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
@@ -212,6 +247,7 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DispatchOutput,
     ):
+        _maybe_log_expert_load(self, dispatch_output)
 
         if self.deprecate_flag:
             return super().run_moe_core(

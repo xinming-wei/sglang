@@ -2394,6 +2394,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
+        from sglang.srt.layers.moe.expert_load_logger import ExpertLoadLogger
+
+        _ell = ExpertLoadLogger.get()
+        _ell_active = _ell.enabled and not forward_batch.forward_mode.is_idle()
+        if _ell_active:
+            _ell.on_forward_start(not forward_batch.forward_mode.is_decode())
+
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
             forward_batch,
@@ -2426,6 +2433,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     reinit_attn_backend,
                     split_forward_count,
                 )
+        if _ell_active:
+            _ell.on_forward_end()
+
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache
