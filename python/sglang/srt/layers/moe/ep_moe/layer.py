@@ -27,7 +27,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPNormalCombineInput,
 )
 from sglang.srt.layers.moe.token_dispatcher.moriep import MoriEPNormalCombineInput
-from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
@@ -37,6 +37,7 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu, is_cuda
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -83,8 +84,11 @@ def _maybe_log_expert_load(moe_layer, dispatch_output):
     if not DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
         return
 
+    num_local_experts = getattr(
+        moe_layer, "num_local_physical_experts", moe_layer.num_local_experts
+    )
     ell.init_tensors(
-        num_local_experts=moe_layer.num_local_experts,
+        num_local_experts=num_local_experts,
         ep_rank=moe_layer.moe_ep_rank,
         ep_size=moe_layer.moe_ep_size,
         global_rank=(
@@ -164,6 +168,65 @@ class DeepEPMoE(FusedMoE):
 
         self.deepep_mode = get_deepep_mode()
 
+        # UltraEP online load balancing
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        self.ultra_ep_enabled = (
+            server_args is not None
+            and getattr(server_args, "ultra_ep_num_redundant_per_rank", 0) > 0
+            and getattr(server_args, "enable_ultra_ep", False)
+        )
+        self.ultra_ep_mgr = None
+        self._ultra_ep_ws_event = None
+        self._ultra_ep_master_registered = False
+
+        if self.ultra_ep_enabled:
+            assert not self.use_fp8_w8a8, (
+                "UltraEP only supports bf16 models. FP8 quantization is not compatible."
+            )
+            assert not self.use_w4afp8, (
+                "UltraEP only supports bf16 models. W4AFP8 quantization is not compatible."
+            )
+
+            from sglang.srt.layers.moe.ep_moe.ultra_ep_manager import (
+                get_or_create_ultra_ep_manager,
+            )
+            from sglang.srt.distributed.parallel_state import get_tp_group
+
+            num_redundant_per_rank = server_args.ultra_ep_num_redundant_per_rank
+
+            self.ultra_ep_mgr = get_or_create_ultra_ep_manager(
+                ep_group=get_tp_group().device_group,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=self.intermediate_size_per_partition,
+                num_redundant_experts_per_rank=num_redundant_per_rank,
+            )
+
+            self.num_local_master_experts = self.num_local_experts
+            self.num_local_physical_experts = (
+                self.ultra_ep_mgr.num_local_physical_experts
+            )
+
+            w13_views, w2_views = self.ultra_ep_mgr.get_redundant_weight_views()
+            self.eplb_w13_redundant = w13_views
+            self.eplb_w2_redundant = w2_views
+
+            # Override dispatcher expert counts so dispatch routes to physical experts.
+            # moe_runner_config was already set by FusedMoE.__init__; update and
+            # re-create the dispatcher with physical expert counts.
+            self.moe_runner_config.num_experts = (
+                self.ultra_ep_mgr.num_global_physical_experts
+            )
+            self.moe_runner_config.num_local_experts = (
+                self.ultra_ep_mgr.num_local_physical_experts
+            )
+            from sglang.srt.layers.moe.fused_moe_triton.layer import (
+                create_moe_dispatcher,
+            )
+            self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+
         if (
             self.deepep_mode.enable_low_latency()
             and not _is_npu
@@ -210,6 +273,38 @@ class DeepEPMoE(FusedMoE):
         else:
             return self.forward_impl(hidden_states, topk_output)
 
+    def _ultra_ep_pre_dispatch(
+        self, topk_output: TopKOutput
+    ) -> TopKOutput:
+        """Run UltraEP placement update, weight sync, and reroute before dispatch."""
+        topk_ids = topk_output.topk_ids.to(torch.int64).clone()
+        is_prefill = get_is_extend_in_batch()
+
+        if is_prefill:
+            # Lazily register master weight pointers after model loading
+            if not self._ultra_ep_master_registered:
+                self.ultra_ep_mgr.register_master_weights(
+                    self.layer_id, self.w13_weight, self.w2_weight
+                )
+                self._ultra_ep_master_registered = True
+
+            self.ultra_ep_mgr.update_placement_sparse(self.layer_id, topk_ids)
+            self._ultra_ep_ws_event = self.ultra_ep_mgr.weight_sync(
+                self.layer_id, async_finish=True
+            )
+
+        self.ultra_ep_mgr.reroute_sparse(self.layer_id, topk_ids)
+
+        if is_prefill and self._ultra_ep_ws_event is not None:
+            self._ultra_ep_ws_event.current_stream_wait()
+            self._ultra_ep_ws_event = None
+
+        return StandardTopKOutput(
+            topk_weights=topk_output.topk_weights,
+            topk_ids=topk_ids,
+            router_logits=getattr(topk_output, "router_logits", None),
+        )
+
     def forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -222,7 +317,9 @@ class DeepEPMoE(FusedMoE):
                 topk_output,
             )
 
-        # TODO: can we call super().forward here?
+        if self.ultra_ep_enabled:
+            topk_output = self._ultra_ep_pre_dispatch(topk_output)
+
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
@@ -358,6 +455,18 @@ class DeepEPMoE(FusedMoE):
         )
         return output
 
+    def _get_expert_weight(self, expert_id: int):
+        """Return (w13, w2) weight tensors for the given local physical expert."""
+        if not self.ultra_ep_enabled or expert_id < self.num_local_master_experts:
+            return self.w13_weight[expert_id], self.w2_weight[expert_id]
+        r = expert_id - self.num_local_master_experts
+        return self.eplb_w13_redundant[r], self.eplb_w2_redundant[r]
+
+    def _get_num_compute_experts(self) -> int:
+        if self.ultra_ep_enabled:
+            return self.num_local_physical_experts
+        return self.num_local_experts
+
     def forward_deepep_normal_bf16(
         self,
         dispatch_output: DeepEPNormalDispatchOutput,
@@ -366,6 +475,7 @@ class DeepEPMoE(FusedMoE):
 
         Scatters tokens by expert, runs per-expert BF16 GEMMs with activation,
         then gathers results back with routing weights applied.
+        When UltraEP is enabled, iterates over all physical experts (masters + replicas).
         """
         from sglang.srt.layers.moe.ep_moe.kernels import (
             deepep_permute_triton_kernel,
@@ -387,12 +497,13 @@ class DeepEPMoE(FusedMoE):
 
         hidden_size = hidden_states.shape[1]
         top_k = topk_ids.shape[1]
+        num_compute_experts = self._get_num_compute_experts()
 
         reorder_topk_ids, src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
-            topk_ids, self.num_local_experts
+            topk_ids, num_compute_experts
         )
 
-        num_valid_tokens = int(seg_indptr[self.num_local_experts].item())
+        num_valid_tokens = int(seg_indptr[num_compute_experts].item())
         if num_valid_tokens == 0:
             return torch.zeros(
                 (num_tokens, hidden_size),
@@ -418,7 +529,8 @@ class DeepEPMoE(FusedMoE):
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
-        intermediate_size = self.w2_weight.shape[2]
+        w13_0, w2_0 = self._get_expert_weight(0)
+        intermediate_size = w2_0.shape[1]
         down_output = torch.empty(
             (num_valid_tokens, hidden_size),
             device=hidden_states.device,
@@ -429,16 +541,16 @@ class DeepEPMoE(FusedMoE):
         if _is_cuda_device:
             from sgl_kernel import silu_and_mul as _silu_and_mul
 
-        for expert_id in range(self.num_local_experts):
+        for expert_id in range(num_compute_experts):
             start = int(seg_indptr[expert_id].item())
             end = int(seg_indptr[expert_id + 1].item())
             if start == end:
                 continue
 
+            w13, w2 = self._get_expert_weight(expert_id)
+
             expert_input = gateup_input[start:end]
-            gate_up = torch.mm(
-                expert_input, self.w13_weight[expert_id].t()
-            )
+            gate_up = torch.mm(expert_input, w13.t())
 
             if _is_cuda_device:
                 intermediate = torch.empty(
@@ -451,9 +563,7 @@ class DeepEPMoE(FusedMoE):
                 gate, up = gate_up.chunk(2, dim=-1)
                 intermediate = F.silu(gate) * up
 
-            down_output[start:end] = torch.mm(
-                intermediate, self.w2_weight[expert_id].t()
-            )
+            down_output[start:end] = torch.mm(intermediate, w2.t())
 
         output = torch.zeros(
             (num_tokens, hidden_size),

@@ -700,6 +700,10 @@ class ServerArgs:
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
 
+    # For UltraEP
+    enable_ultra_ep: bool = False
+    ultra_ep_num_redundant_per_rank: int = 0
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -5063,6 +5067,20 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.forward_hooks,
             help="JSON-formatted forward hook specifications to attach to the model.",
+        )
+
+        # For UltraEP
+        parser.add_argument(
+            "--enable-ultra-ep",
+            action="store_true",
+            default=ServerArgs.enable_ultra_ep,
+            help="Enable UltraEP.",
+        )
+        parser.add_argument(
+            "--ultra-ep-num-redundant-per-rank",
+            type=int,
+            default=ServerArgs.ultra_ep_num_redundant_per_rank,
+            help="Number of redundant experts per rank in UltraEP.",
         )
 
     @classmethod
