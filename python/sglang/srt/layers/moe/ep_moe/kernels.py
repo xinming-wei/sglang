@@ -180,6 +180,99 @@ def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
 
 
 @triton.jit
+def _moe_histogram_kernel(
+    topk_ids_ptr,
+    counts_ptr,
+    total_elems,
+    BLOCK: tl.constexpr,
+):
+    """Pass 1: atomically count received tokens per expert.
+
+    Replaces torch.sort + torch.arange + torch.searchsorted with a single
+    O(T·K) atomic-add pass over topk_ids. Invalid expert slots (-1) are
+    skipped.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total_elems
+    eid = tl.load(topk_ids_ptr + offs, mask=mask, other=-1).to(tl.int32)
+    valid = (eid >= 0) & mask
+    tl.atomic_add(counts_ptr + eid, 1, mask=valid)
+
+
+@triton.jit
+def _moe_scatter_src2dst_kernel(
+    topk_ids_ptr,
+    src2dst_ptr,
+    starts_ptr,
+    total_elems,
+    BLOCK: tl.constexpr,
+):
+    """Pass 2: assign each valid (token, topk_slot) a unique destination row.
+
+    For each flat index i:
+    - expert_id >= 0: src2dst[i] = atomic_fetch_add(starts[expert_id], 1)
+      giving a unique slot inside that expert's contiguous segment.
+    - expert_id == -1: src2dst[i] = -1 (sentinel, skipped by permute kernel).
+
+    starts[e] is initialised to seg_indptr[e] (exclusive prefix sum) so the
+    returned slots are the absolute row indices in the permuted buffer.
+    Ordering within a segment is non-deterministic but irrelevant for
+    correctness since src2dst is the authoritative round-trip mapping.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total_elems
+    eid = tl.load(topk_ids_ptr + offs, mask=mask, other=-1).to(tl.int32)
+    valid = (eid >= 0) & mask
+    # atomic_add returns OLD value (= our unique slot); 0 for invalid lanes
+    slot = tl.atomic_add(starts_ptr + eid, 1, mask=valid, sem="relaxed").to(
+        tl.int64
+    )
+    out = tl.where(valid, slot, tl.full([BLOCK], -1, tl.int64))
+    tl.store(src2dst_ptr + offs, out, mask=mask)
+
+
+def deepep_grouped_gemm_preprocess(topk_ids: torch.Tensor, num_experts: int):
+    """Fully on-device preprocess for grouped GEMM MoE — zero D2H, O(T·K).
+
+    Replaces the sort-based approach (sort + arange + searchsorted + subtract,
+    O(T·K log T·K), ~4 fragmented kernel launches) with two Triton kernels:
+
+    1. _moe_histogram_kernel  — O(T·K) atomic histogram, single kernel
+    2. torch.cumsum           — O(E), ~free for small E (num local experts)
+    3. _moe_scatter_src2dst   — O(T·K) atomic fetch-add scatter, single kernel
+
+    Returns:
+        src2dst:   [T·K] int64 — flat index → permuted buffer row (-1 = invalid)
+        seg_indptr:[E+1] int64 — exclusive prefix sum of per-expert token counts
+    """
+    total = topk_ids.numel()
+    device = topk_ids.device
+    BLOCK = 512
+    grid = (triton.cdiv(total, BLOCK),)
+
+    # Pass 1: per-expert token counts via atomic histogram
+    counts = torch.zeros(num_experts, device=device, dtype=torch.int32)
+    _moe_histogram_kernel[grid](topk_ids, counts, total, BLOCK=BLOCK)
+
+    # Exclusive prefix sum: O(E), essentially free for small E
+    # inclusive[e] = sum(counts[0..e]);  starts[e] = sum(counts[0..e-1])
+    inclusive = torch.cumsum(counts, 0)          # [E] int32, single kernel
+    seg_indptr = torch.empty(num_experts + 1, device=device, dtype=torch.int64)
+    seg_indptr[0] = 0
+    seg_indptr[1:] = inclusive                   # D2D int32→int64 copy, no D2H
+    starts = inclusive.sub_(counts)              # in-place: inclusive - counts
+                                                 # = exclusive prefix, reuses buffer
+
+    # Pass 2: scatter each (token, topk_slot) to its unique permuted buffer row
+    src2dst = torch.empty(total, device=device, dtype=torch.int64)
+    _moe_scatter_src2dst_kernel[grid](topk_ids, src2dst, starts, total, BLOCK=BLOCK)
+
+    return src2dst, seg_indptr
+
+
+@triton.jit
 def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
     expert_id_minus_1 = tl.program_id(0) - 1
     low = 0

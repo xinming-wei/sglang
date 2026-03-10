@@ -467,20 +467,54 @@ class DeepEPMoE(FusedMoE):
             return self.num_local_physical_experts
         return self.num_local_experts
 
+    def _ensure_weight_ptrs_registered(self):
+        """Lazily build device pointer tables for grouped GEMM.
+
+        Collects data_ptr() of each expert's weight (both master and UltraEP
+        redundant) into int64 device tensors.  Called once; addresses are stable
+        after model loading since parameters and NVSHMEM buffers don't move.
+        """
+        if getattr(self, "_w13_ptrs", None) is not None:
+            return
+
+        from sglang.srt.layers.moe.ep_moe.triton_grouped_gemm import (
+            build_weight_ptr_table,
+        )
+
+        self._w13_ptrs = build_weight_ptr_table(
+            self.w13_weight,
+            self.eplb_w13_redundant if self.ultra_ep_enabled else None,
+        )
+        self._w2_ptrs = build_weight_ptr_table(
+            self.w2_weight,
+            self.eplb_w2_redundant if self.ultra_ep_enabled else None,
+        )
+
+        self._w13_N = self.w13_weight.shape[1]  # 2 * intermediate_size
+        self._w13_K = self.w13_weight.shape[2]  # hidden_size
+        self._w2_N = self.w2_weight.shape[1]  # hidden_size
+        self._w2_K = self.w2_weight.shape[2]  # intermediate_size
+
     def forward_deepep_normal_bf16(
         self,
         dispatch_output: DeepEPNormalDispatchOutput,
     ):
-        """BF16 MoE forward for DeepEP normal mode.
+        """BF16 MoE forward for DeepEP normal mode — Triton grouped GEMM.
 
-        Scatters tokens by expert, runs per-expert BF16 GEMMs with activation,
-        then gathers results back with routing weights applied.
-        When UltraEP is enabled, iterates over all physical experts (masters + replicas).
+        Replaces the naive per-expert for-loop + torch.mm with a single
+        persistent-CTA Triton grouped GEMM kernel per projection.  Fully
+        on-device: zero host-device synchronization.
+
+        When UltraEP is enabled, the weight pointer table includes both master
+        and redundant expert weights (accessed by pointer, no D2D copy needed).
         """
         from sglang.srt.layers.moe.ep_moe.kernels import (
+            deepep_grouped_gemm_preprocess,
             deepep_permute_triton_kernel,
             deepep_post_reorder_triton_kernel,
-            deepep_run_moe_deep_preprocess,
+        )
+        from sglang.srt.layers.moe.ep_moe.triton_grouped_gemm import (
+            grouped_gemm_bf16,
         )
 
         (
@@ -488,7 +522,7 @@ class DeepEPMoE(FusedMoE):
             _hidden_states_scale,
             topk_ids,
             topk_weights,
-            num_recv_tokens_per_expert,
+            _num_recv_tokens_per_expert,
         ) = dispatch_output
 
         num_tokens = hidden_states.shape[0]
@@ -499,24 +533,24 @@ class DeepEPMoE(FusedMoE):
         top_k = topk_ids.shape[1]
         num_compute_experts = self._get_num_compute_experts()
 
-        reorder_topk_ids, src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
+        self._ensure_weight_ptrs_registered()
+
+        # Fully on-device preprocess (no D2H transfers)
+        src2dst, seg_indptr = deepep_grouped_gemm_preprocess(
             topk_ids, num_compute_experts
         )
 
-        num_valid_tokens = int(seg_indptr[num_compute_experts].item())
-        if num_valid_tokens == 0:
-            return torch.zeros(
-                (num_tokens, hidden_size),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
+        # Upper-bound buffer size — avoids the D2H that seg_indptr[E].item()
+        # would incur.  The grouped GEMM kernel only touches rows within each
+        # expert's segment so unused rows are harmless.
+        max_tokens = topk_ids.numel()
 
+        # --- Permute input tokens by expert assignment ---
         gateup_input = torch.empty(
-            (num_valid_tokens, hidden_size),
+            (max_tokens, hidden_size),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-
         BLOCK_SIZE = min(triton.next_power_of_2(hidden_size), 1024)
         deepep_permute_triton_kernel[(num_tokens,)](
             hidden_states,
@@ -529,10 +563,25 @@ class DeepEPMoE(FusedMoE):
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
-        w13_0, w2_0 = self._get_expert_weight(0)
-        intermediate_size = w2_0.shape[1]
-        down_output = torch.empty(
-            (num_valid_tokens, hidden_size),
+        # --- GEMM 1: gate-up projection  [M_g, H] @ [2I, H]^T = [M_g, 2I] ---
+        gate_up = torch.empty(
+            (max_tokens, self._w13_N),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        grouped_gemm_bf16(
+            gateup_input,
+            self._w13_ptrs,
+            gate_up,
+            seg_indptr,
+            num_compute_experts,
+            N=self._w13_N,
+            K=self._w13_K,
+        )
+
+        # --- SiLU activation + element-wise multiply ---
+        intermediate = torch.empty(
+            (max_tokens, self._w2_K),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
@@ -541,30 +590,25 @@ class DeepEPMoE(FusedMoE):
         if _is_cuda_device:
             from sgl_kernel import silu_and_mul as _silu_and_mul
 
-        for expert_id in range(num_compute_experts):
-            start = int(seg_indptr[expert_id].item())
-            end = int(seg_indptr[expert_id + 1].item())
-            if start == end:
-                continue
+            _silu_and_mul(gate_up, intermediate)
+        else:
+            gate, up = gate_up.chunk(2, dim=-1)
+            intermediate = F.silu(gate) * up
 
-            w13, w2 = self._get_expert_weight(expert_id)
+        # --- GEMM 2: down projection  [M_g, I] @ [H, I]^T = [M_g, H] ---
+        # Reuse the gateup_input buffer (same shape, no longer needed)
+        down_output = gateup_input
+        grouped_gemm_bf16(
+            intermediate,
+            self._w2_ptrs,
+            down_output,
+            seg_indptr,
+            num_compute_experts,
+            N=self._w2_N,
+            K=self._w2_K,
+        )
 
-            expert_input = gateup_input[start:end]
-            gate_up = torch.mm(expert_input, w13.t())
-
-            if _is_cuda_device:
-                intermediate = torch.empty(
-                    (end - start, intermediate_size),
-                    device=gate_up.device,
-                    dtype=gate_up.dtype,
-                )
-                _silu_and_mul(gate_up, intermediate)
-            else:
-                gate, up = gate_up.chunk(2, dim=-1)
-                intermediate = F.silu(gate) * up
-
-            down_output[start:end] = torch.mm(intermediate, w2.t())
-
+        # --- Post-reorder: gather expert outputs with routing weights ---
         output = torch.zeros(
             (num_tokens, hidden_size),
             device=hidden_states.device,
