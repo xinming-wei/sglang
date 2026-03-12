@@ -2211,13 +2211,19 @@ class ServerArgs:
             if self.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
             if os.environ.get("SGLANG_MOE_NVFP4_DISPATCH") is None:
-                envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
+                if self.moe_runner_backend == "flashinfer_cutlass":
+                    envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
+                    logger.warning(
+                        "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A with flashinfer_cutlass"
+                    )
+                else:
+                    envs.SGLANG_MOE_NVFP4_DISPATCH.set(False)
+            if self.moe_runner_backend not in ("flashinfer_cutlass", "auto"):
                 logger.warning(
-                    "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
+                    f"Flashinfer MoE A2A is typically used with flashinfer_cutlass runner, "
+                    f"but got moe_runner_backend={self.moe_runner_backend!r}. "
+                    f"Proceeding with custom MoE compute kernel."
                 )
-            assert self.moe_runner_backend in [
-                "flashinfer_cutlass"
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass moe runner backend"
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size

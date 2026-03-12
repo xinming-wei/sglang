@@ -45,6 +45,9 @@ if TYPE_CHECKING:
         DeepEPNormalDispatchOutput,
         DispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferDispatchOutput,
+    )
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -355,11 +358,12 @@ class DeepEPMoE(FusedMoE):
 
         if _use_aiter:
             assert DispatchOutputChecker.format_is_deepep(dispatch_output)
-            # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             output = self.forward_aiter(dispatch_output)
         elif _is_npu:
             assert DispatchOutputChecker.format_is_deepep(dispatch_output)
             output = self.forward_npu(dispatch_output)
+        elif DispatchOutputChecker.format_is_flashinfer(dispatch_output):
+            return self._run_moe_core_flashinfer(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             if self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8(dispatch_output)
@@ -390,6 +394,50 @@ class DeepEPMoE(FusedMoE):
             topk_ids=dispatch_output.topk_ids,
             topk_weights=dispatch_output.topk_weights,
         )
+
+    def _run_moe_core_flashinfer(self, dispatch_output):
+        """Handle FlashInfer A2A dispatch output with BF16 grouped GEMM.
+
+        FlashInfer A2A preserves global expert IDs in the dispatch payload,
+        whereas the grouped GEMM kernels expect local expert IDs in
+        [0, num_local_experts).  We remap here: local experts are shifted to
+        0-based indices, non-local expert slots are set to -1.
+
+        Each rank computes a partial weighted sum over its local experts only.
+        FlashinferDispatcher.combine routes these partial sums back to the
+        original sender ranks and accumulates them into the final output.
+        """
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+            FlashinferCombineInput,
+        )
+
+        hidden_states = dispatch_output.hidden_states
+        topk_ids = dispatch_output.topk_output.topk_ids
+        topk_weights = dispatch_output.topk_output.topk_weights
+
+        assert not self.use_fp8_w8a8, (
+            "FP8 models are not supported with FlashInfer A2A bf16 grouped GEMM path"
+        )
+        assert not self.use_w4afp8, (
+            "W4AFP8 models are not supported with FlashInfer A2A bf16 grouped GEMM path"
+        )
+
+        # Remap global expert IDs → local (0-based).
+        # FlashInfer A2A keeps global IDs in the payload; DeepEP converts to
+        # local during dispatch. The histogram / scatter kernels in
+        # deepep_grouped_gemm_preprocess index into counts[eid] of size
+        # num_local_experts, so global IDs would cause OOB access.
+        num_local = self._get_num_compute_experts()
+        local_start = self.moe_ep_rank * num_local
+        shifted = topk_ids - local_start
+        topk_ids = torch.where(
+            (shifted >= 0) & (shifted < num_local),
+            shifted,
+            -1,
+        )
+
+        output = self._run_bf16_grouped_gemm(hidden_states, topk_ids, topk_weights)
+        return FlashinferCombineInput(hidden_states=output)
 
     def combine(
         self,
@@ -495,18 +543,18 @@ class DeepEPMoE(FusedMoE):
         self._w2_N = self.w2_weight.shape[1]  # hidden_size
         self._w2_K = self.w2_weight.shape[2]  # intermediate_size
 
-    def forward_deepep_normal_bf16(
+    def _run_bf16_grouped_gemm(
         self,
-        dispatch_output: DeepEPNormalDispatchOutput,
-    ):
-        """BF16 MoE forward for DeepEP normal mode — Triton grouped GEMM.
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Core BF16 grouped GEMM: permute → gate-up → SiLU·mul → down → unpermute.
 
-        Replaces the naive per-expert for-loop + torch.mm with a single
-        persistent-CTA Triton grouped GEMM kernel per projection.  Fully
-        on-device: zero host-device synchronization.
-
-        When UltraEP is enabled, the weight pointer table includes both master
-        and redundant expert weights (accessed by pointer, no D2D copy needed).
+        Shared by DeepEP normal and FlashInfer A2A paths. Fully on-device with
+        zero host-device synchronization. The permute/unpermute kernels skip
+        entries with topk_ids == -1 (invalid/padded slots), so both compact
+        (DeepEP) and padded (FlashInfer) input layouts are handled correctly.
         """
         from sglang.srt.layers.moe.ep_moe.kernels import (
             deepep_grouped_gemm_preprocess,
@@ -516,14 +564,6 @@ class DeepEPMoE(FusedMoE):
         from sglang.srt.layers.moe.ep_moe.triton_grouped_gemm import (
             grouped_gemm_bf16,
         )
-
-        (
-            hidden_states,
-            _hidden_states_scale,
-            topk_ids,
-            topk_weights,
-            _num_recv_tokens_per_expert,
-        ) = dispatch_output
 
         num_tokens = hidden_states.shape[0]
         if num_tokens == 0:
@@ -535,7 +575,6 @@ class DeepEPMoE(FusedMoE):
 
         self._ensure_weight_ptrs_registered()
 
-        # Fully on-device preprocess (no D2H transfers)
         src2dst, seg_indptr = deepep_grouped_gemm_preprocess(
             topk_ids, num_compute_experts
         )
@@ -626,6 +665,19 @@ class DeepEPMoE(FusedMoE):
         )
 
         return output
+
+    def forward_deepep_normal_bf16(
+        self,
+        dispatch_output: DeepEPNormalDispatchOutput,
+    ):
+        (
+            hidden_states,
+            _hidden_states_scale,
+            topk_ids,
+            topk_weights,
+            _num_recv_tokens_per_expert,
+        ) = dispatch_output
+        return self._run_bf16_grouped_gemm(hidden_states, topk_ids, topk_weights)
 
     def forward_deepep_ll_bf16(
         self,
@@ -1057,6 +1109,8 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_a2a_backend().is_mori():
         return MoriEPMoE
     if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        return DeepEPMoE
+    if get_moe_a2a_backend().is_flashinfer():
         return DeepEPMoE
     if get_moe_a2a_backend().is_ascend_fuseep():
         return NpuFuseEPMoE

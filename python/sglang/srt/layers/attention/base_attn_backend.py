@@ -88,7 +88,10 @@ class AttentionBackend(ABC):
     ):
         """Run forward on an attention layer."""
         if forward_batch.forward_mode.is_idle():
-            return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            # Idle DP workers can be padded up to a non-zero local token count to
+            # keep downstream MoE collectives well-formed. Return zeros here so
+            # the synthetic tokens do not inherit uninitialized attention output.
+            return q.new_zeros(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
                 q,

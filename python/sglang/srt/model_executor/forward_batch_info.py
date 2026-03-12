@@ -52,6 +52,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
@@ -753,6 +754,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
+        )
+        # FlashInfer MoE A2A does not tolerate decode/idle workers entering the
+        # MLP sync path with zero local tokens. Reuse the existing MAX_LEN DP
+        # padding path so every rank gets at least one padded token; post-forward
+        # slicing strips the synthetic outputs back to the original batch size.
+        force_max_len_dp_padding = (
+            get_moe_a2a_backend().is_flashinfer()
+            and self.forward_mode.is_decode_or_idle()
+            and not self.is_extend_in_batch
+            and max(global_num_tokens) > 0
+            and min(global_num_tokens) == 0
+        )
+        dp_padding_mode = (
+            DpPaddingMode.MAX_LEN
+            if force_max_len_dp_padding
+            else DpPaddingMode.get_dp_padding_mode(
+                self.is_extend_in_batch, global_num_tokens
+            )
         )
         self.dp_padding_mode = dp_padding_mode
 

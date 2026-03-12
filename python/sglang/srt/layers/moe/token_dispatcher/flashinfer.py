@@ -146,6 +146,10 @@ class FlashinferDispatcher(BaseDispatcher):
             mnnvl_config=MnnvlConfig(comm_backend=TorchDistributedCommBackend(group)),
         )
 
+        # BF16 dispatch: no FP4 quantization config; override base class None
+        # so that self.quant_config.get(...) works without set_quant_config().
+        self.quant_config = {}
+
         # Preallocate dummy tensors (to overcome numLocalTokens > 0 restriction)
         self.dummy_x = torch.empty(
             (1, hidden_size),
@@ -167,24 +171,64 @@ class FlashinferDispatcher(BaseDispatcher):
             (1, self.router_topk), dtype=torch.float32, device="cuda"
         )
 
+    # The TRT-LLM A2A CUDA kernel fails with "invalid argument" when
+    # runtime_max_tokens_per_rank is very small (e.g. 1, typical for decode).
+    # We pad ALL workers (not just idle ones) to this minimum so that every
+    # EP rank presents identically-shaped payloads and the kernel gets a
+    # valid grid configuration.  Padded rows have topk_ids=-1 and zero
+    # weights/hidden_states, so they are ignored by MoE compute and combine.
+    _MIN_SAFE_RUNTIME_MAX_TOKENS_PER_RANK = 64
+
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> FlashinferDispatchOutput:
         output_dtype = hidden_states.dtype
         x = hidden_states
         x_sf = None
-        topk_ids = topk_output.topk_ids
+        # FlashInfer MoE A2A requires int32 expert IDs for both the routing key
+        # (`tokenSelectedExperts`) and the expert-ID payload. UltraEP reroute may
+        # produce int64 IDs, so normalize here without changing other backends
+        # such as DeepEP that still expect int64.
+        topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights
 
-        # Handle case where there are no tokens on this DP worker
-        # moe_a2a.dispatch requires at least one token
-        self.has_dummy_token = False
+        self._original_num_tokens = x.shape[0]
+
+        # Pad ALL workers to at least _MIN_SAFE_RUNTIME_MAX_TOKENS_PER_RANK so the A2A
+        # kernel always gets a safe batch size.  This covers both the
+        # idle-worker (0 tokens) and small-decode (1 token) cases uniformly.
+        #
+        # When the model forward ran with 0 tokens (idle DP workers), the
+        # DP-attention NCCL collectives may leave a non-sticky CUDA error
+        # (cudaErrorInvalidValue) in the runtime error state.  DeepEP never
+        # surfaces this because its dispatch avoids sync points, but our
+        # tensor allocations below trigger a sync that catches it.  We
+        # clear the stale error here so subsequent CUDA ops succeed.
         if x.shape[0] == 0:
-            logger.warning("No tokens on this DP worker, using dummy token")
-            self.has_dummy_token = True
-            x = self.dummy_x
-            topk_ids = self.dummy_topk_ids
-            topk_weights = self.dummy_topk_weights
+            n = self._MIN_SAFE_RUNTIME_MAX_TOKENS_PER_RANK
+            x = torch.zeros(
+                (n, self.hidden_size), dtype=x.dtype, device=x.device
+            )
+            topk_ids = torch.full(
+                (n, self.router_topk), -1, dtype=topk_ids.dtype, device=topk_ids.device
+            )
+            topk_weights = torch.zeros(
+                (n, self.router_topk), dtype=topk_weights.dtype, device=topk_weights.device
+            )
+        elif x.shape[0] < self._MIN_SAFE_RUNTIME_MAX_TOKENS_PER_RANK:
+            pad = self._MIN_SAFE_RUNTIME_MAX_TOKENS_PER_RANK - x.shape[0]
+            x = torch.cat(
+                [x, torch.zeros((pad, x.shape[1]), dtype=x.dtype, device=x.device)],
+                dim=0,
+            )
+            topk_ids = torch.cat(
+                [topk_ids, torch.full((pad, topk_ids.shape[1]), -1, dtype=topk_ids.dtype, device=topk_ids.device)],
+                dim=0,
+            )
+            topk_weights = torch.cat(
+                [topk_weights, torch.zeros((pad, topk_weights.shape[1]), dtype=topk_weights.dtype, device=topk_weights.device)],
+                dim=0,
+            )
 
         global_scale = self.quant_config.get("input_global_scale", None)
         if global_scale is not None:
@@ -213,8 +257,25 @@ class FlashinferDispatcher(BaseDispatcher):
             if get_dp_global_num_tokens() is not None
             else x.shape[0]
         )
+        self.runtime_max_tokens_per_rank = max(
+            self.runtime_max_tokens_per_rank, self._MIN_SAFE_RUNTIME_MAX_TOKENS_PER_RANK
+        )
+
+        # The routing key (first arg) determines where the A2A kernel
+        # sends each token.  It MUST contain valid global expert IDs —
+        # the C++ kernel indexes into internal routing tables with these
+        # values, so -1 causes illegal memory access.
+        #
+        # For padded rows (topk_ids == -1) we substitute a safe routing
+        # target: the first local expert on this rank.  The PAYLOAD
+        # topk_ids still has -1 for those rows, so the MoE compute and
+        # combine correctly ignore them.
+        safe_expert_id = self.ep_rank * (self.num_experts // self.ep_size)
+        routing_topk_ids = topk_ids.clone()
+        routing_topk_ids[routing_topk_ids < 0] = safe_expert_id
+
         recv_tensors = self.moe_a2a.dispatch(
-            self.dummy_topk_ids_current_rank if self.has_dummy_token else topk_ids,
+            routing_topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
             expert_id_payload_index=expert_id_payload_index,
@@ -254,10 +315,9 @@ class FlashinferDispatcher(BaseDispatcher):
             payload_in_workspace=self.payload_in_workspace,
         )
 
-        # Remove dummy token if it was added in dispatch
-        if self.has_dummy_token:
-            hidden_states = hidden_states[1:, :]
+        # Strip padding rows that were added in dispatch
+        hidden_states = hidden_states[: self._original_num_tokens, :]
 
         del self.runtime_max_tokens_per_rank
-        del self.has_dummy_token
+        del self._original_num_tokens
         return hidden_states

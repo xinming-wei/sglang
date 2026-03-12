@@ -254,7 +254,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
-        if get_moe_a2a_backend().is_deepep():
+        self._enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_flashinfer()
+        )
+
+        if self._enable_a2a_moe:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -270,10 +276,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
 
-        if (
-            not get_moe_a2a_backend().is_deepep()
-            and not get_moe_a2a_backend().is_ascend_fuseep()
-        ):
+        if not self._enable_a2a_moe:
             return self.forward_normal(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
