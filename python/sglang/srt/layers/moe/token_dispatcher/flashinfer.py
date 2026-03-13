@@ -100,7 +100,6 @@ class FlashinferDispatcher(BaseDispatcher):
         # TODO: Can this be a server arg and shared with deepep/mooncakeep?
         self.max_num_tokens = (
             get_int_env_var("SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024)
-            * self.ep_size
         )
 
         # Calculate workspace size. For eagle mode, use the larger workspace size since nextn layer will be unquantized.
