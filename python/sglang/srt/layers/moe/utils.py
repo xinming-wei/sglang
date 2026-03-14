@@ -21,6 +21,7 @@ class MoeA2ABackend(Enum):
 
     NONE = "none"
     DEEPEP = "deepep"
+    HYBRIDEP = "hybridep"
     MOONCAKE = "mooncake"
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
@@ -40,6 +41,9 @@ class MoeA2ABackend(Enum):
 
     def is_deepep(self):
         return self == MoeA2ABackend.DEEPEP
+
+    def is_hybridep(self):
+        return self == MoeA2ABackend.HYBRIDEP
 
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE

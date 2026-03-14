@@ -717,6 +717,7 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
 
                 body = {
                     "activities": getattr(args, "profile_activities", []),
+                    "start_step": getattr(args, "profile_start_step", None),
                     "num_steps": num_steps,
                     "profile_by_stage": profile_by_stage,
                     "profile_stages": getattr(args, "profile_stages", None),
@@ -3217,6 +3218,14 @@ if __name__ == "__main__":
         nargs="+",
         default=["CPU", "GPU"],
         choices=["CPU", "GPU", "CUDA_PROFILER"],
+    )
+    parser.add_argument(
+        "--profile-start-step",
+        type=int,
+        default=None,
+        help="Start profiling after this many forward steps. "
+        "For serving benchmarks, the count begins after warmup because the "
+        "profiler is armed only after warmup completes.",
     )
     parser.add_argument("--profile-num-steps", type=int, default=None)
     parser.add_argument("--profile-by-stage", action="store_true", default=False)

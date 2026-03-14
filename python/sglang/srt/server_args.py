@@ -188,6 +188,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
 MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
+    "hybridep",
     "mooncake",
     "mori",
     "ascend_fuseep",
@@ -493,7 +494,13 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
-        "none", "deepep", "mooncake", "mori", "ascend_fuseep", "flashinfer"
+        "none",
+        "deepep",
+        "hybridep",
+        "mooncake",
+        "mori",
+        "ascend_fuseep",
+        "flashinfer",
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
@@ -2224,6 +2231,22 @@ class ServerArgs:
                     f"but got moe_runner_backend={self.moe_runner_backend!r}. "
                     f"Proceeding with custom MoE compute kernel."
                 )
+
+        if self.moe_a2a_backend == "hybridep":
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"HybridEP MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "HybridEP MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
+            )
+            if not self.disable_cuda_graph:
+                logger.warning("Cuda graph is disabled because HybridEP only supports normal mode")
+                self.disable_cuda_graph = True
+            if self.deepep_mode != "auto":
+                logger.warning("--deepep-mode is ignored for HybridEP MoE A2A")
+            self.deepep_mode = "normal"
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size

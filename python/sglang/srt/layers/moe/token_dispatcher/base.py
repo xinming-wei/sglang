@@ -27,6 +27,8 @@ if TYPE_CHECKING:
         DeepEPNormalDispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
+        HybridEPCombineInput,
+        HybridEPDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -157,6 +159,12 @@ class DispatchOutputChecker:
     ) -> TypeGuard[FlashinferDispatchOutput]:
         return dispatch_output.format.is_flashinfer()
 
+    @staticmethod
+    def format_is_hybridep(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[HybridEPDispatchOutput]:
+        return dispatch_output.format.is_hybridep()
+
 
 class DispatchOutputFormat(Enum):
 
@@ -164,6 +172,7 @@ class DispatchOutputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
+    HYBRIDEP = "hybridep"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -182,6 +191,9 @@ class DispatchOutputFormat(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DispatchOutputFormat.FLASHINFER
+
+    def is_hybridep(self) -> bool:
+        return self == DispatchOutputFormat.HYBRIDEP
 
 
 @runtime_checkable
@@ -231,12 +243,19 @@ class CombineInputChecker:
     ) -> TypeGuard[FlashinferCombineInput]:
         return combine_input.format == CombineInputFormat.FLASHINFER
 
+    @staticmethod
+    def format_is_hybridep(
+        combine_input: CombineInput,
+    ) -> TypeGuard[HybridEPCombineInput]:
+        return combine_input.format == CombineInputFormat.HYBRIDEP
+
 
 class CombineInputFormat(Enum):
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
+    HYBRIDEP = "hybridep"
 
 
 @runtime_checkable

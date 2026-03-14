@@ -84,7 +84,15 @@ def _maybe_log_expert_load(moe_layer, dispatch_output):
 
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
-    if not DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+    if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+        num_recv_tokens_per_expert = dispatch_output.num_recv_tokens_per_expert
+    elif DispatchOutputChecker.format_is_hybridep(dispatch_output):
+        tokens_per_expert = dispatch_output.tokens_per_expert
+        if isinstance(tokens_per_expert, torch.Tensor):
+            num_recv_tokens_per_expert = tokens_per_expert.tolist()
+        else:
+            num_recv_tokens_per_expert = list(tokens_per_expert)
+    else:
         return
 
     num_local_experts = getattr(
@@ -102,7 +110,7 @@ def _maybe_log_expert_load(moe_layer, dispatch_output):
     )
     ell.record(
         layer_id=moe_layer.layer_id,
-        num_recv_tokens_per_expert=dispatch_output.num_recv_tokens_per_expert,
+        num_recv_tokens_per_expert=num_recv_tokens_per_expert,
     )
 
 
@@ -364,6 +372,8 @@ class DeepEPMoE(FusedMoE):
             output = self.forward_npu(dispatch_output)
         elif DispatchOutputChecker.format_is_flashinfer(dispatch_output):
             return self._run_moe_core_flashinfer(dispatch_output)
+        elif DispatchOutputChecker.format_is_hybridep(dispatch_output):
+            return self._run_moe_core_hybridep(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             if self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8(dispatch_output)
@@ -438,6 +448,32 @@ class DeepEPMoE(FusedMoE):
 
         output = self._run_bf16_grouped_gemm(hidden_states, topk_ids, topk_weights)
         return FlashinferCombineInput(hidden_states=output)
+
+    def _run_moe_core_hybridep(self, dispatch_output):
+        """Handle HybridEP fused-permute dispatch with BF16 grouped GEMM.
+
+        HybridEP returns tokens already laid out as contiguous expert segments, so
+        MoE compute must consume the pre-permuted layout directly. Routing
+        weights are applied after the second GEMM; for BF16 inference without
+        expert bias this is equivalent to weighting before the combine step.
+        """
+        from sglang.srt.layers.moe.token_dispatcher.hybridep import (
+            HybridEPCombineInput,
+        )
+
+        assert not self.use_fp8_w8a8, (
+            "FP8 models are not supported with HybridEP bf16 grouped GEMM path"
+        )
+        assert not self.use_w4afp8, (
+            "W4AFP8 models are not supported with HybridEP bf16 grouped GEMM path"
+        )
+
+        output = self._run_bf16_grouped_gemm_prepermuted(
+            dispatch_output.hidden_states,
+            dispatch_output.tokens_per_expert,
+            dispatch_output.routing_weights,
+        )
+        return HybridEPCombineInput(hidden_states=output)
 
     def combine(
         self,
@@ -542,6 +578,27 @@ class DeepEPMoE(FusedMoE):
         self._w13_K = self.w13_weight.shape[2]  # hidden_size
         self._w2_N = self.w2_weight.shape[1]  # hidden_size
         self._w2_K = self.w2_weight.shape[2]  # intermediate_size
+
+    def _build_seg_indptr_from_tokens_per_expert(
+        self,
+        tokens_per_expert: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        num_compute_experts = self._get_num_compute_experts()
+        tokens_per_expert = tokens_per_expert.to(
+            device=device, dtype=torch.int64, non_blocking=True
+        )
+        if tokens_per_expert.numel() != num_compute_experts:
+            raise ValueError(
+                "HybridEP tokens_per_expert size does not match local physical expert count"
+            )
+
+        seg_indptr = torch.empty(
+            num_compute_experts + 1, device=device, dtype=torch.int64
+        )
+        seg_indptr[0] = 0
+        seg_indptr[1:] = torch.cumsum(tokens_per_expert, dim=0)
+        return seg_indptr
 
     def _run_bf16_grouped_gemm(
         self,
@@ -663,6 +720,85 @@ class DeepEPMoE(FusedMoE):
             hidden_size,
             BLOCK_SIZE=BLOCK_SIZE,
         )
+
+        return output
+
+    def _run_bf16_grouped_gemm_prepermuted(
+        self,
+        hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        routing_weights: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """BF16 grouped GEMM for input already permuted by expert.
+
+        HybridEP dispatch performs both communication and expert-side permute, so
+        local expert segments are already contiguous. We only need segmented GEMM
+        and a final per-row routing-weight multiply before combine.
+        """
+        from sglang.srt.layers.moe.ep_moe.triton_grouped_gemm import (
+            grouped_gemm_bf16,
+        )
+
+        num_tokens = hidden_states.shape[0]
+        if num_tokens == 0:
+            return hidden_states
+
+        num_compute_experts = self._get_num_compute_experts()
+        self._ensure_weight_ptrs_registered()
+        seg_indptr = self._build_seg_indptr_from_tokens_per_expert(
+            tokens_per_expert, hidden_states.device
+        )
+
+        gate_up = torch.empty(
+            (num_tokens, self._w13_N),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        grouped_gemm_bf16(
+            hidden_states,
+            self._w13_ptrs,
+            gate_up,
+            seg_indptr,
+            num_compute_experts,
+            N=self._w13_N,
+            K=self._w13_K,
+        )
+
+        intermediate = torch.empty(
+            (num_tokens, self._w2_K),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        _is_cuda_device = is_cuda()
+        if _is_cuda_device:
+            from sgl_kernel import silu_and_mul as _silu_and_mul
+
+            _silu_and_mul(gate_up, intermediate)
+        else:
+            gate, up = gate_up.chunk(2, dim=-1)
+            intermediate = F.silu(gate) * up
+
+        output = torch.empty(
+            (num_tokens, self._w2_N),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        grouped_gemm_bf16(
+            intermediate,
+            self._w2_ptrs,
+            output,
+            seg_indptr,
+            num_compute_experts,
+            N=self._w2_N,
+            K=self._w2_K,
+        )
+
+        if routing_weights is not None:
+            output.mul_(
+                routing_weights.to(device=output.device, dtype=output.dtype).unsqueeze(
+                    -1
+                )
+            )
 
         return output
 
@@ -1110,7 +1246,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         return MoriEPMoE
     if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
         return DeepEPMoE
-    if get_moe_a2a_backend().is_flashinfer():
+    if get_moe_a2a_backend().is_flashinfer() or get_moe_a2a_backend().is_hybridep():
         return DeepEPMoE
     if get_moe_a2a_backend().is_ascend_fuseep():
         return NpuFuseEPMoE

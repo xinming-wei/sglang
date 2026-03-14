@@ -755,12 +755,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
-        # FlashInfer MoE A2A does not tolerate decode/idle workers entering the
-        # MLP sync path with zero local tokens. Reuse the existing MAX_LEN DP
-        # padding path so every rank gets at least one padded token; post-forward
-        # slicing strips the synthetic outputs back to the original batch size.
+        # FlashInfer/HybridEP MoE A2A does not tolerate decode/idle workers
+        # entering the MLP sync path with zero local tokens. Reuse the existing
+        # MAX_LEN DP padding path so every rank gets at least one padded token;
+        # post-forward slicing strips the synthetic outputs back to the original
+        # batch size.
         force_max_len_dp_padding = (
-            get_moe_a2a_backend().is_flashinfer()
+            (
+                get_moe_a2a_backend().is_flashinfer()
+                or get_moe_a2a_backend().is_hybridep()
+            )
             and self.forward_mode.is_decode_or_idle()
             and not self.is_extend_in_batch
             and max(global_num_tokens) > 0

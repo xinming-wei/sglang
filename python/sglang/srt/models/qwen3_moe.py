@@ -256,6 +256,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_hybridep()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
         )
