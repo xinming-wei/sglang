@@ -708,10 +708,8 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
 
                 output_dir = getattr(args, "profile_output_dir", None)
                 if output_dir is None:
-                    output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
-                output_dir = Path(os.path.abspath(os.path.normpath(output_dir))) / str(
-                    time.time()
-                )
+                    output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp/sgl_profile_results")
+                output_dir = Path(os.path.abspath(os.path.normpath(output_dir)))
                 output_dir.mkdir(exist_ok=True, parents=True)
                 output_dir = str(output_dir)
 
