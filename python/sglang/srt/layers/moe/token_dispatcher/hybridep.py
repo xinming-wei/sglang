@@ -6,6 +6,16 @@ from typing import NamedTuple, Optional
 
 import torch
 
+try:
+    import triton
+    import triton.language as tl
+
+    _TRITON_AVAILABLE = True
+except ImportError:
+    triton = None
+    tl = None
+    _TRITON_AVAILABLE = False
+
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -25,6 +35,168 @@ try:
     use_hybridep = True
 except (ImportError, AttributeError):
     use_hybridep = False
+
+
+def _build_dense_routing_map_torch(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    valid_mask = topk_ids >= 0
+    safe_topk_ids = topk_ids.clamp_min(0)
+    topk_weights = topk_weights.to(torch.float32)
+
+    probs = torch.zeros(
+        (topk_ids.shape[0], num_experts),
+        dtype=torch.float32,
+        device=topk_weights.device,
+    )
+    probs.scatter_add_(
+        1,
+        safe_topk_ids,
+        topk_weights * valid_mask.to(topk_weights.dtype),
+    )
+
+    routing_counts = torch.zeros(
+        (topk_ids.shape[0], num_experts),
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    routing_counts.scatter_add_(1, safe_topk_ids, valid_mask.to(torch.int32))
+    return routing_counts > 0, probs
+
+
+def _should_use_fused_dense_routing_map(device: torch.device) -> bool:
+    # if not _TRITON_AVAILABLE or device.type != "cuda":
+    #     return False
+    # major, _ = torch.cuda.get_device_capability(device)
+    # return major >= 9
+    return True
+
+
+def _dense_routing_map_launch_config(
+    num_experts: int,
+) -> tuple[int, int, int]:
+    if num_experts <= 64:
+        return 64, 64, 4
+    if num_experts <= 128:
+        return 32, 128, 4
+    return 16, 128, 8
+
+
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _dense_routing_map_kernel(
+        topk_ids_ptr,
+        topk_weights_ptr,
+        routing_map_ptr,
+        probs_ptr,
+        num_tokens,
+        num_experts,
+        topk_stride,
+        routing_stride,
+        probs_stride,
+        TOPK: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_E: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_e = tl.program_id(1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_e = pid_e * BLOCK_E + tl.arange(0, BLOCK_E)
+        token_mask = offs_m < num_tokens
+        expert_mask = offs_e < num_experts
+
+        experts = offs_e[None, :]
+        probs = tl.zeros((BLOCK_M, BLOCK_E), dtype=tl.float32)
+        routed = tl.zeros((BLOCK_M, BLOCK_E), dtype=tl.int1)
+
+        for k in range(TOPK):
+            ids_k = tl.load(
+                topk_ids_ptr + offs_m * topk_stride + k,
+                mask=token_mask,
+                other=-1,
+            ).to(tl.int32)
+            weights_k = tl.load(
+                topk_weights_ptr + offs_m * topk_stride + k,
+                mask=token_mask,
+                other=0,
+            ).to(tl.float32)
+            match = (ids_k[:, None] >= 0) & (ids_k[:, None] == experts)
+            probs += match.to(tl.float32) * weights_k[:, None]
+            routed = routed | match
+
+        out_mask = token_mask[:, None] & expert_mask[None, :]
+        tl.store(
+            probs_ptr + offs_m[:, None] * probs_stride + experts,
+            probs,
+            mask=out_mask,
+        )
+        tl.store(
+            routing_map_ptr + offs_m[:, None] * routing_stride + experts,
+            routed,
+            mask=out_mask,
+        )
+
+
+def _build_dense_routing_map_fused(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if topk_ids.ndim != 2 or topk_weights.ndim != 2:
+        raise ValueError("topk_ids and topk_weights must be rank-2 tensors")
+    if topk_ids.shape != topk_weights.shape:
+        raise ValueError("topk_ids and topk_weights must have identical shapes")
+    if topk_ids.device != topk_weights.device:
+        raise ValueError("topk_ids and topk_weights must live on the same device")
+    if topk_ids.numel() == 0 or num_experts == 0:
+        shape = (topk_ids.shape[0], num_experts)
+        return (
+            torch.empty(shape, device=topk_ids.device, dtype=torch.bool),
+            torch.empty(shape, device=topk_weights.device, dtype=torch.float32),
+        )
+    if not _should_use_fused_dense_routing_map(topk_ids.device):
+        return _build_dense_routing_map_torch(topk_ids, topk_weights, num_experts)
+
+    topk_ids = topk_ids.contiguous()
+    topk_weights = topk_weights.contiguous()
+    num_tokens, topk = topk_ids.shape
+    routing_map = torch.empty(
+        (num_tokens, num_experts),
+        dtype=torch.bool,
+        device=topk_ids.device,
+    )
+    probs = torch.empty(
+        (num_tokens, num_experts),
+        dtype=torch.float32,
+        device=topk_weights.device,
+    )
+
+    block_m, block_e, num_warps = _dense_routing_map_launch_config(num_experts)
+    grid = (
+        triton.cdiv(num_tokens, block_m),
+        triton.cdiv(num_experts, block_e),
+    )
+    _dense_routing_map_kernel[grid](
+        topk_ids,
+        topk_weights,
+        routing_map,
+        probs,
+        num_tokens,
+        num_experts,
+        topk_ids.stride(0),
+        routing_map.stride(0),
+        probs.stride(0),
+        TOPK=topk,
+        BLOCK_M=block_m,
+        BLOCK_E=block_e,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+    return routing_map, probs
 
 
 class _HybridEPSharedBuffer:
@@ -279,28 +451,23 @@ class HybridEPDispatcher(BaseDispatcher):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        valid_mask = topk_ids >= 0
-        safe_topk_ids = topk_ids.clamp_min(0)
-        topk_weights = topk_weights.to(torch.float32)
+        if _should_use_fused_dense_routing_map(topk_ids.device):
+            return self._build_dense_routing_map_fused(topk_ids, topk_weights)
+        return self._build_dense_routing_map_torch(topk_ids, topk_weights)
 
-        probs = torch.zeros(
-            (topk_ids.shape[0], self.num_experts),
-            dtype=torch.float32,
-            device=topk_weights.device,
-        )
-        probs.scatter_add_(
-            1,
-            safe_topk_ids,
-            topk_weights * valid_mask.to(topk_weights.dtype),
-        )
+    def _build_dense_routing_map_torch(
+        self,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _build_dense_routing_map_torch(topk_ids, topk_weights, self.num_experts)
 
-        routing_counts = torch.zeros(
-            (topk_ids.shape[0], self.num_experts),
-            dtype=torch.int32,
-            device=topk_ids.device,
-        )
-        routing_counts.scatter_add_(1, safe_topk_ids, valid_mask.to(torch.int32))
-        return routing_counts > 0, probs
+    def _build_dense_routing_map_fused(
+        self,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _build_dense_routing_map_fused(topk_ids, topk_weights, self.num_experts)
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
