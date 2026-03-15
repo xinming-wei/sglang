@@ -66,6 +66,8 @@ class UltraEPManager:
             is_train=False,
             explicitly_destroy=False,
             max_microbatches=1,
+            use_gpu_solver=True,
+            balance_threshold=0.0,
         )
 
         self.local_replica_weight_buffer: torch.Tensor = (
