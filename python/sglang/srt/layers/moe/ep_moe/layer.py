@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 import torch.nn.functional as F
 import triton
+import triton.language as tl
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
@@ -114,6 +115,92 @@ def _maybe_log_expert_load(moe_layer, dispatch_output):
     )
 
 
+@triton.jit
+def _router_force_balance_topk_ids_kernel(
+    template_topk_ids_ptr,
+    forced_topk_ids_ptr,
+    num_tokens,
+    topk,
+    template_row_stride,
+    forced_row_stride,
+    num_experts,
+    rank_slot_offset,
+    global_token_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    row_mask = row < num_tokens
+    first_expert = tl.load(
+        template_topk_ids_ptr + row * template_row_stride,
+        mask=row_mask,
+        other=-1,
+    ).to(tl.int32)
+    valid_row = first_expert >= 0
+    slot_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = row_mask & (slot_offsets < topk)
+    balanced_experts = (
+        row * global_token_stride + rank_slot_offset + slot_offsets
+    ) % num_experts
+    values = tl.where(
+        valid_row,
+        balanced_experts.to(tl.int32),
+        tl.full((BLOCK_SIZE,), -1, tl.int32),
+    )
+    tl.store(
+        forced_topk_ids_ptr + row * forced_row_stride + slot_offsets,
+        values,
+        mask=mask,
+    )
+
+
+def _build_force_balanced_topk_ids(
+    template_topk_ids: torch.Tensor,
+    *,
+    num_experts: int,
+    ep_rank: int,
+    ep_size: int,
+) -> torch.Tensor:
+    num_tokens, topk = template_topk_ids.shape
+    forced_topk_ids = torch.empty(
+        (num_tokens, topk), device=template_topk_ids.device, dtype=torch.int32
+    )
+    if num_tokens == 0 or topk == 0:
+        return forced_topk_ids
+
+    rank_slot_offset = ep_rank * topk
+    global_token_stride = ep_size * topk
+
+    if template_topk_ids.device.type == "cuda":
+        block_size = min(triton.next_power_of_2(topk), 1024)
+        _router_force_balance_topk_ids_kernel[(num_tokens,)](
+            template_topk_ids,
+            forced_topk_ids,
+            num_tokens,
+            topk,
+            template_topk_ids.stride(0),
+            forced_topk_ids.stride(0),
+            num_experts,
+            rank_slot_offset,
+            global_token_stride,
+            BLOCK_SIZE=block_size,
+            num_warps=1,
+            num_stages=1,
+        )
+        return forced_topk_ids
+
+    valid_rows = template_topk_ids[:, 0] >= 0
+    row_base = torch.arange(
+        num_tokens, device=template_topk_ids.device, dtype=torch.int64
+    )
+    row_base.mul_(global_token_stride).add_(rank_slot_offset)
+    slot_offsets = torch.arange(topk, device=template_topk_ids.device, dtype=torch.int64)
+    forced_topk_ids.copy_(
+        ((row_base.unsqueeze(1) + slot_offsets) % num_experts).to(torch.int32)
+    )
+    forced_topk_ids.masked_fill_(~valid_rows.unsqueeze(1), -1)
+    return forced_topk_ids
+
+
 class DeepEPMoE(FusedMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
@@ -121,6 +208,8 @@ class DeepEPMoE(FusedMoE):
     """
 
     _has_printed = False
+    _has_logged_router_force_balance = False
+    _has_logged_router_force_balance_unsupported = False
 
     def __init__(
         self,
@@ -176,6 +265,26 @@ class DeepEPMoE(FusedMoE):
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
+
+        self.router_force_balance_enabled = get_bool_env_var(
+            "SGLANG_ROUTER_FORCE_BALANCE"
+        )
+        if self.router_force_balance_enabled and self.num_fused_shared_experts > 0:
+            logger.warning(
+                "SGLANG_ROUTER_FORCE_BALANCE ignores fused shared experts; disabling it for layer %s.",
+                self.layer_id,
+            )
+            self.router_force_balance_enabled = False
+
+        if (
+            self.router_force_balance_enabled
+            and not DeepEPMoE._has_logged_router_force_balance
+        ):
+            logger.warning(
+                "SGLANG_ROUTER_FORCE_BALANCE is enabled. Router logits/top-k are still computed, "
+                "but routed expert IDs will be overwritten with a deterministic balanced pattern."
+            )
+            DeepEPMoE._has_logged_router_force_balance = True
 
         self.deepep_mode = get_deepep_mode()
 
@@ -316,6 +425,37 @@ class DeepEPMoE(FusedMoE):
             router_logits=getattr(topk_output, "router_logits", None),
         )
 
+    def _maybe_force_balance_topk(self, topk_output: TopKOutput) -> TopKOutput:
+        if not self.router_force_balance_enabled:
+            return topk_output
+
+        if not TopKOutputChecker.format_is_standard(topk_output):
+            if not DeepEPMoE._has_logged_router_force_balance_unsupported:
+                logger.warning(
+                    "SGLANG_ROUTER_FORCE_BALANCE currently only supports standard top-k outputs. "
+                    "Falling back to the original router assignments."
+                )
+                DeepEPMoE._has_logged_router_force_balance_unsupported = True
+            return topk_output
+
+        routed_num_experts = (
+            topk_output.router_logits.shape[-1]
+            if getattr(topk_output, "router_logits", None) is not None
+            and topk_output.router_logits.ndim >= 2
+            else self.num_experts - self.num_fused_shared_experts
+        )
+        forced_topk_ids = _build_force_balanced_topk_ids(
+            topk_output.topk_ids,
+            num_experts=routed_num_experts,
+            ep_rank=self.moe_ep_rank,
+            ep_size=self.moe_ep_size,
+        )
+        return StandardTopKOutput(
+            topk_weights=topk_output.topk_weights,
+            topk_ids=forced_topk_ids,
+            router_logits=topk_output.router_logits,
+        )
+
     def forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -327,6 +467,10 @@ class DeepEPMoE(FusedMoE):
                 hidden_states,
                 topk_output,
             )
+
+        # Keep router compute in the profile, but overwrite the selected experts
+        # with a deterministic balanced pattern for benchmark-focused runs.
+        topk_output = self._maybe_force_balance_topk(topk_output)
 
         if self.ultra_ep_enabled:
             topk_output = self._ultra_ep_pre_dispatch(topk_output)
