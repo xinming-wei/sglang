@@ -80,7 +80,7 @@ def _maybe_log_expert_load(moe_layer, dispatch_output):
 
         _expert_load_logger_cached = ExpertLoadLogger.get()
     ell = _expert_load_logger_cached
-    if not ell.enabled:
+    if not ell.enabled or not ell.should_record_current_forward():
         return
 
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
