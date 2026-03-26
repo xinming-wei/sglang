@@ -29,7 +29,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -39,6 +38,12 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     ScatterMode,
+)
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -242,15 +247,14 @@ def rms_apply_serial(
 
 
 class MiniMaxM2RMSNormTP(nn.Module):
-    """RMSNorm with Tensor Parallel support for QK normalization."""
+    """RMSNorm with attention-TP support for QK normalization."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.tp_world = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_world = get_attention_tp_size()
 
-        # Weight parameter is sharded across TP ranks
-        self.weight = nn.Parameter(torch.ones(int(hidden_size / self.tp_world)))
+        # Weight parameter is sharded across the attention TP group.
+        self.weight = nn.Parameter(torch.ones(hidden_size // self.tp_world))
         self.weight.weight_loader = self.weight_loader
         self.variance_epsilon = eps
 
@@ -259,9 +263,9 @@ class MiniMaxM2RMSNormTP(nn.Module):
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
     ) -> None:
-        """Custom weight loader that handles TP sharding."""
-        tp_world = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        """Custom weight loader that handles attention-TP sharding."""
+        tp_world = get_attention_tp_size()
+        tp_rank = get_attention_tp_rank()
 
         shard_size = loaded_weight.shape[0] // tp_world
         shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
@@ -283,8 +287,8 @@ class MiniMaxM2RMSNormTP(nn.Module):
         variance = x.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32)
 
         if self.tp_world > 1:
-            # All-reduce variance across TP ranks to get global variance
-            variance = tensor_model_parallel_all_reduce(variance) / self.tp_world
+            # All-reduce variance across attention TP ranks to get global variance.
+            variance = attn_tp_all_reduce(variance) / self.tp_world
 
         # Normalize and apply local weight shard
         x = x * torch.rsqrt(variance + self.variance_epsilon)
@@ -298,10 +302,10 @@ class MiniMaxM2RMSNormTP(nn.Module):
         k_norm: "MiniMaxM2RMSNormTP",
         q: torch.Tensor,
         k: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         sum_sq = rms_sumsq_serial(q, k)
         if q_norm.tp_world > 1:
-            sum_sq = tensor_model_parallel_all_reduce(sum_sq)
+            sum_sq = attn_tp_all_reduce(sum_sq)
 
         q, k = rms_apply_serial(
             q,
@@ -372,10 +376,18 @@ class MiniMaxM2MoE(nn.Module):
         )
 
         self.layer_id = layer_id
+        self.ep_size = 1
+        self.top_k = config.num_experts_per_tok
+        self._enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_hybridep()
+            or get_moe_a2a_backend().is_flashinfer()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+        )
 
-        if get_moe_a2a_backend().is_deepep():
+        if self._enable_a2a_moe:
             self.ep_size = get_moe_expert_parallel_world_size()
-            self.top_k = config.num_experts_per_tok
 
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -385,7 +397,7 @@ class MiniMaxM2MoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        if get_moe_a2a_backend().is_deepep():
+        if self._enable_a2a_moe:
             return self.forward_deepep(hidden_states, forward_batch)
         else:
             return self.forward_normal(hidden_states)
@@ -451,7 +463,7 @@ class MiniMaxM2MoE(nn.Module):
                 )
             )
             with ctx:
-                state.topk_weights_local, state.topk_idx_local, _ = self.topk(
+                state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
@@ -460,21 +472,14 @@ class MiniMaxM2MoE(nn.Module):
                     ),
                 )
         else:
-            state.topk_idx_local = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-            )
-            state.topk_weights_local = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-            )
+            state.topk_output = self.topk.empty_topk_output(device=hidden_states.device)
 
     def op_dispatch_a(self, state):
         """Dispatch A operation for TBO - start async dispatch"""
         if self.ep_size > 1:
-            self.experts.deepep_dispatcher.dispatch_a(
+            self.experts.dispatcher.dispatch_a(
                 hidden_states=state.pop("hidden_states_mlp_input"),
-                topk_idx=state.pop("topk_idx_local"),
-                topk_weights=state.pop("topk_weights_local"),
-                forward_batch=state.forward_batch,
+                topk_output=state.pop("topk_output"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -489,24 +494,21 @@ class MiniMaxM2MoE(nn.Module):
                 )
             )
             with ctx:
-                state.dispatch_output = self.experts.deepep_dispatcher.dispatch_b(
+                state.dispatch_output = self.experts.dispatcher.dispatch_b(
                     tbo_subbatch_index=state.get("tbo_subbatch_index"),
                 )
 
     def op_experts(self, state):
         """Expert computation for TBO"""
-        state.hidden_states_experts_output = self.experts.moe_impl(
+        state.combine_input = self.experts.run_moe_core(
             dispatch_output=state.dispatch_output,
         )
 
     def op_combine_a(self, state):
         """Combine A operation for TBO - start async combine"""
         if self.ep_size > 1:
-            self.experts.deepep_dispatcher.combine_a(
-                hidden_states=state.pop("hidden_states_experts_output"),
-                topk_idx=state.dispatch_output.topk_idx,
-                topk_weights=state.dispatch_output.topk_weights,
-                forward_batch=state.forward_batch,
+            self.experts.dispatcher.combine_a(
+                combine_input=state.pop("combine_input"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
             state.pop("dispatch_output")
@@ -515,7 +517,7 @@ class MiniMaxM2MoE(nn.Module):
         """Combine B operation for TBO - complete async combine"""
         if self.ep_size > 1:
             state.hidden_states_after_combine = (
-                self.experts.deepep_dispatcher.combine_b(
+                self.experts.dispatcher.combine_b(
                     tbo_subbatch_index=state.get("tbo_subbatch_index"),
                 )
             )
@@ -539,23 +541,24 @@ class MiniMaxM2Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
 
         # Get dimensions from config
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        assert self.total_num_heads % attn_tp_size == 0
+        self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = config.num_key_value_heads
 
-        if self.total_num_kv_heads >= tp_size:
+        if self.total_num_kv_heads >= attn_tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+            assert self.total_num_kv_heads % attn_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert attn_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
 
         # Use head_dim from config if available, otherwise calculate
         self.head_dim = getattr(
@@ -583,6 +586,8 @@ class MiniMaxM2Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -592,6 +597,8 @@ class MiniMaxM2Attention(nn.Module):
             bias=False,
             reduce_results=False,
             quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -635,6 +642,8 @@ class MiniMaxM2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if hidden_states.shape[0] == 0:
+            return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
@@ -650,7 +659,9 @@ class MiniMaxM2Attention(nn.Module):
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
-        _, _, inner_state = intermediate_state
+        hidden_states, _, inner_state = intermediate_state
+        if inner_state is None:
+            return hidden_states
         attn_output = self.attn(*inner_state)
         output, _ = self.o_proj(attn_output)
         return output
@@ -847,6 +858,8 @@ class MiniMaxM2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            use_attn_tp_group=is_dp_attention_enabled(),
+            prefix=add_prefix("embed_tokens", prefix),
         )
 
         def layer_fn(idx, prefix: str) -> nn.Module:
@@ -928,10 +941,11 @@ class MiniMaxM2Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        if residual is not None:
-            hidden_states, _ = self.norm(hidden_states, residual)
-        else:
-            hidden_states = self.norm(hidden_states)
+        if hidden_states.shape[0] != 0:
+            if residual is not None:
+                hidden_states, _ = self.norm(hidden_states, residual)
+            else:
+                hidden_states = self.norm(hidden_states)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -962,6 +976,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=None,
                 prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()
@@ -1046,56 +1061,61 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if ("mlp.experts." in name) and name not in params_dict:
+                if "experts." in name:
                     continue
-                name = name.replace(weight_name, param_name)
+                mapped_name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if mapped_name.endswith(".bias") and mapped_name not in params_dict:
+                    continue
+                if mapped_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[mapped_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(mapped_name)
                 break
             else:
+                is_expert_weight = False
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
-                    name = name.replace(weight_name, param_name)
+                    is_expert_weight = True
+                    mapped_name = name.replace(weight_name, param_name)
+                    if mapped_name not in params_dict:
+                        continue
 
-                    param = params_dict[name]
+                    param = params_dict[mapped_name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
                         loaded_weight,
-                        name,
+                        mapped_name,
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
+                    loaded_params.add(mapped_name)
                     break
                 else:
+                    if is_expert_weight:
+                        continue
+
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
 
                     # Remapping the name of FP8 kv-scale.
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
+                    mapped_name = maybe_remap_kv_scale_name(name, params_dict)
+                    if mapped_name is None or mapped_name not in params_dict:
                         continue
 
-                    param = params_dict[name]
+                    param = params_dict[mapped_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+                    loaded_params.add(mapped_name)
         return loaded_params
 
     @classmethod

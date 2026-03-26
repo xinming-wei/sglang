@@ -65,6 +65,7 @@ class SiluAndMul(MultiPlatformOp):
         super().__init__(*args, **kwargs)
         if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
+        self._warned_cuda_pointer_alignment = False
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -74,6 +75,16 @@ class SiluAndMul(MultiPlatformOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        if (x.data_ptr() & 0xF) != 0 or (out.data_ptr() & 0xF) != 0:
+            if not self._warned_cuda_pointer_alignment:
+                logger.warning(
+                    "Falling back to native SiluAndMul because CUDA kernel requires "
+                    "16-byte-aligned pointers, but got x=%d, out=%d.",
+                    x.data_ptr(),
+                    out.data_ptr(),
+                )
+                self._warned_cuda_pointer_alignment = True
+            return self.forward_native(x)
         silu_and_mul(x, out)
         return out
 

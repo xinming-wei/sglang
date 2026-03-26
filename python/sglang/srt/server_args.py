@@ -71,6 +71,108 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+
+def _local_checkpoint_has_serialized_fp8_weights(
+    model_path: str,
+    sample_shards: int = 2,
+    sample_tensors_per_shard: int = 32,
+) -> Optional[bool]:
+    """Best-effort fallback for local checkpoints missing quantization metadata."""
+    if not os.path.isdir(model_path):
+        return None
+
+    try:
+        shard_names = sorted(
+            name for name in os.listdir(model_path) if name.endswith(".safetensors")
+        )
+    except OSError:
+        return None
+
+    if not shard_names:
+        return None
+
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return None
+
+    inspected_tensors = 0
+    for shard_name in shard_names[:sample_shards]:
+        shard_path = os.path.join(model_path, shard_name)
+        try:
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                keys = list(f.keys())
+                if any(name.endswith("_scale_inv") for name in keys):
+                    return True
+
+                for name in keys[:sample_tensors_per_shard]:
+                    inspected_tensors += 1
+                    if str(f.get_slice(name).get_dtype()).startswith("F8_"):
+                        return True
+        except Exception as exc:
+            logger.warning(
+                "Failed to inspect local checkpoint shard %s for quantization fallback: %s",
+                shard_path,
+                exc,
+            )
+            return None
+
+    if inspected_tensors == 0:
+        return None
+
+    return False
+
+
+def _local_checkpoint_looks_bf16(
+    model_path: str,
+    sample_shards: int = 1,
+    sample_tensors_per_shard: int = 32,
+) -> Optional[bool]:
+    """Best-effort probe for local BF16 checkpoints missing torch_dtype metadata."""
+    if not os.path.isdir(model_path):
+        return None
+
+    try:
+        shard_names = sorted(
+            name for name in os.listdir(model_path) if name.endswith(".safetensors")
+        )
+    except OSError:
+        return None
+
+    if not shard_names:
+        return None
+
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return None
+
+    inspected_tensors = 0
+    saw_bf16_tensor = False
+    for shard_name in shard_names[:sample_shards]:
+        shard_path = os.path.join(model_path, shard_name)
+        try:
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for name in list(f.keys())[:sample_tensors_per_shard]:
+                    inspected_tensors += 1
+                    dtype = str(f.get_slice(name).get_dtype())
+                    if dtype == "BF16":
+                        saw_bf16_tensor = True
+                    elif dtype not in {"F32"}:
+                        return False
+        except Exception as exc:
+            logger.warning(
+                "Failed to inspect local checkpoint shard %s for dtype fallback: %s",
+                shard_path,
+                exc,
+            )
+            return None
+
+    if inspected_tensors == 0:
+        return None
+
+    return saw_bf16_tensor
+
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
@@ -1196,7 +1298,8 @@ class ServerArgs:
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
 
-        hf_config = self.get_model_config().hf_config
+        model_config = self.get_model_config()
+        hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
 
         if model_arch in [
@@ -1304,10 +1407,27 @@ class ServerArgs:
                     # Because we need this condition for an assertion in
                     # flashinfer_trtllm MoE runner backend.
                     if quant_method is None and model_arch in ["DeepseekV3ForCausalLM"]:
-                        self.quantization = "fp8"
-                        logger.info(
-                            "Quantization not specified, default to fp8 for DeepSeek on sm100"
+                        has_serialized_fp8_weights = (
+                            _local_checkpoint_has_serialized_fp8_weights(
+                                self.model_path
+                            )
                         )
+                        if has_serialized_fp8_weights is False:
+                            logger.info(
+                                "Detected local DeepSeek checkpoint without serialized FP8 weights; "
+                                "leaving quantization unset to use bf16 kernels."
+                            )
+                        else:
+                            self.quantization = "fp8"
+                            if has_serialized_fp8_weights:
+                                logger.info(
+                                    "Quantization not specified; detected serialized FP8 weights "
+                                    "in local DeepSeek checkpoint, default to fp8 on sm100"
+                                )
+                            else:
+                                logger.info(
+                                    "Quantization not specified, default to fp8 for DeepSeek on sm100"
+                                )
                     else:
                         self.quantization = quant_method
                 if (
@@ -1636,6 +1756,25 @@ class ServerArgs:
                         logger.info(
                             "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
                         )
+
+        elif model_arch in ["MiniMaxM2ForCausalLM"]:
+            if self.dtype == "auto":
+                local_ckpt_is_bf16 = _local_checkpoint_looks_bf16(self.model_path)
+                if local_ckpt_is_bf16:
+                    import torch
+
+                    self.dtype = "bfloat16"
+                    model_config.dtype = torch.bfloat16
+                    logger.info(
+                        "Detected local MiniMax checkpoint with serialized BF16 weights; "
+                        "setting dtype to bfloat16."
+                    )
+
+            if self.is_attention_backend_not_set():
+                self.attention_backend = "triton"
+                logger.info(
+                    "Use triton attention backend for MiniMaxM2ForCausalLM"
+                )
 
         elif model_arch in [
             "FalconH1ForCausalLM",

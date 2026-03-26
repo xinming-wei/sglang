@@ -370,6 +370,13 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             )
 
         self.gate = Glm4MoeGate(config=config, prefix=add_prefix("gate", prefix))
+        a2a_moe_enabled = (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_hybridep()
+            or get_moe_a2a_backend().is_flashinfer()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+        )
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts + self.num_fused_shared_experts,
@@ -412,15 +419,13 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    or get_moe_a2a_backend().is_mooncake()
-                    or get_moe_a2a_backend().is_flashinfer()
+                    if a2a_moe_enabled
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
             )
 
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if a2a_moe_enabled:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -436,9 +441,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 else None
             )
 
-        self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
-        )
+        self._enable_a2a_moe = a2a_moe_enabled
 
     def get_moe_weights(self):
         return [
@@ -458,7 +461,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
 
-        if not get_moe_a2a_backend().is_deepep():
+        if not self._enable_a2a_moe:
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
