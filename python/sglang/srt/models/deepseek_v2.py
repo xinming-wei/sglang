@@ -202,6 +202,18 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _deepseek_a2a_moe_enabled() -> bool:
+    a2a_backend = get_moe_a2a_backend()
+    return (
+        a2a_backend.is_deepep()
+        or a2a_backend.is_mooncake()
+        or a2a_backend.is_hybridep()
+        or a2a_backend.is_mori()
+        or a2a_backend.is_ascend_fuseep()
+        or a2a_backend.is_flashinfer()
+    )
+
+
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
     "nsa",
@@ -408,6 +420,7 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("gate", prefix),
             is_nextn=is_nextn,
         )
+        a2a_moe_enabled = _deepseek_a2a_moe_enabled()
 
         # scaling factor for fused shared experts on AMD-platform.
         fused_shared_experts_scaling_factor = None
@@ -472,11 +485,7 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    or get_moe_a2a_backend().is_mooncake()
-                    or get_moe_a2a_backend().is_mori()
-                    or get_moe_a2a_backend().is_ascend_fuseep()
-                    or get_moe_a2a_backend().is_flashinfer()
+                    if a2a_moe_enabled
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -515,12 +524,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.top_k = config.num_experts_per_tok
 
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_mori()
-            or get_moe_a2a_backend().is_ascend_fuseep()
-        ):
+        if a2a_moe_enabled:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -536,13 +540,7 @@ class DeepseekV2MoE(nn.Module):
                 else None
             )
 
-        self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_mori()
-            or get_moe_a2a_backend().is_ascend_fuseep()
-            or get_moe_a2a_backend().is_flashinfer()
-        )
+        self._enable_a2a_moe = a2a_moe_enabled
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
     def get_moe_weights(self):
@@ -761,7 +759,16 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         shared_output = None
-        sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
+        supports_deepep_overlap = isinstance(
+            self.experts.dispatcher, MaybeTboDeepEPDispatcher
+        )
+        # HybridEP uses a flat pre-permuted layout, while the existing shared
+        # expert overlap hooks assume DeepEP's dispatcher/output contract.
+        sbo_enabled_flag = (
+            self._fuse_shared_experts_inside_sbo
+            and not self.is_nextn
+            and supports_deepep_overlap
+        )
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
         )
@@ -893,7 +900,10 @@ class DeepseekV2MoE(nn.Module):
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
-        elif envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get():
+        elif (
+            supports_deepep_overlap
+            and envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get()
+        ):
             # On GB200: Shared experts overlapped on alt_stream, down gemm overlapped with DeepEP Combine
 
             def _post_dispatch_hook(
@@ -2602,12 +2612,7 @@ class DeepseekV2Model(nn.Module):
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
                     # tp_size = get_tensor_model_parallel_world_size()
-                    a2a_backend = get_moe_a2a_backend()
-                    is_a2a_moe = (
-                        a2a_backend.is_deepep()
-                        or a2a_backend.is_mori()
-                        or a2a_backend.is_mooncake()
-                    )
+                    is_a2a_moe = _deepseek_a2a_moe_enabled()
                     tp_size = (
                         1 if is_a2a_moe else get_tensor_model_parallel_world_size()
                     )
@@ -2629,10 +2634,7 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            self.enable_a2a_moe = True
-        else:
-            self.enable_a2a_moe = False
+        self.enable_a2a_moe = _deepseek_a2a_moe_enabled()
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
@@ -2876,12 +2878,19 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
             disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
-        elif disable_reason is None and (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori()
-        ):
-            disable_reason = "Deepseek V3/R1 cannot use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
+        else:
+            a2a_backend = get_moe_a2a_backend()
+            if (
+                a2a_backend.is_deepep()
+                or a2a_backend.is_mori()
+                or a2a_backend.is_hybridep()
+            ):
+                disable_reason = (
+                    "Deepseek V3/R1 cannot use shared experts fusion optimization "
+                    "under deepep/hybridep/mori expert parallelism."
+                )
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True
