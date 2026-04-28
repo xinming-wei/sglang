@@ -94,8 +94,10 @@ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_group,
+    get_dp_local_info,
     initialize_dp_attention,
     set_dp_buffer_len,
+    set_force_balance_global_token_start,
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -2493,6 +2495,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
                 server_args=self.server_args,
             )
+
+        if (
+            forward_batch.global_num_tokens_gpu is not None
+            and forward_batch.global_num_tokens_gpu.numel() > 1
+        ):
+            dp_local_start_pos, _ = get_dp_local_info(forward_batch)
+            set_force_balance_global_token_start(int(dp_local_start_pos.item()))
+        else:
+            set_force_balance_global_token_start(None)
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(

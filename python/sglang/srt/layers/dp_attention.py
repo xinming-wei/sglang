@@ -95,6 +95,7 @@ class _DpGatheredBufferWrapper:
     _dp_max_padding: bool
     _global_num_tokens: Optional[List[int]]
     _is_extend_in_batch: bool
+    _force_balance_global_token_start: Optional[int] = None
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -168,6 +169,16 @@ class _DpGatheredBufferWrapper:
         return cls._is_extend_in_batch
 
     @classmethod
+    def set_force_balance_global_token_start(
+        cls, global_token_start: Optional[int]
+    ):
+        cls._force_balance_global_token_start = global_token_start
+
+    @classmethod
+    def get_force_balance_global_token_start(cls) -> Optional[int]:
+        return cls._force_balance_global_token_start
+
+    @classmethod
     def is_dp_max_padding(cls) -> bool:
         return cls._dp_max_padding
 
@@ -221,6 +232,14 @@ def set_is_extend_in_batch(is_extend_in_batch: bool):
 
 def get_is_extend_in_batch() -> bool:
     return _DpGatheredBufferWrapper.get_is_extend_in_batch()
+
+
+def set_force_balance_global_token_start(global_token_start: Optional[int]):
+    _DpGatheredBufferWrapper.set_force_balance_global_token_start(global_token_start)
+
+
+def get_force_balance_global_token_start() -> Optional[int]:
+    return _DpGatheredBufferWrapper.get_force_balance_global_token_start()
 
 
 def is_dp_max_padding() -> bool:
@@ -379,12 +398,16 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
     dp_rank = get_attention_dp_rank()
 
     if forward_batch.dp_local_start_pos is None:
-        cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
-        if dp_rank == 0:
-            local_start_pos = torch.zeros_like(cumtokens[0])
+        if forward_batch.global_num_tokens_gpu.numel() == 1:
+            local_start_pos = torch.zeros_like(forward_batch.global_num_tokens_gpu[0])
+            local_num_tokens = forward_batch.global_num_tokens_gpu[0]
         else:
-            local_start_pos = cumtokens[dp_rank - 1]
-        local_num_tokens = forward_batch.global_num_tokens_gpu[dp_rank]
+            cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
+            if dp_rank == 0:
+                local_start_pos = torch.zeros_like(cumtokens[0])
+            else:
+                local_start_pos = cumtokens[dp_rank - 1]
+            local_num_tokens = forward_batch.global_num_tokens_gpu[dp_rank]
 
         forward_batch.dp_local_start_pos = local_start_pos
         forward_batch.dp_local_num_tokens = local_num_tokens

@@ -38,7 +38,10 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu, is_cuda
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+from sglang.srt.layers.dp_attention import (
+    get_force_balance_global_token_start,
+    get_is_extend_in_batch,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -124,8 +127,9 @@ def _router_force_balance_topk_ids_kernel(
     template_row_stride,
     forced_row_stride,
     num_experts,
-    rank_slot_offset,
-    global_token_stride,
+    ep_size,
+    local_experts_per_rank,
+    global_token_start,
     BLOCK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -138,9 +142,12 @@ def _router_force_balance_topk_ids_kernel(
     valid_row = first_expert >= 0
     slot_offsets = tl.arange(0, BLOCK_SIZE)
     mask = row_mask & (slot_offsets < topk)
-    balanced_experts = (
-        row * global_token_stride + rank_slot_offset + slot_offsets
-    ) % num_experts
+    row_i64 = row.to(tl.int64)
+    slot_offsets_i64 = slot_offsets.to(tl.int64)
+    assignment_indices = (global_token_start + row_i64) * topk + slot_offsets_i64
+    dst_ranks = assignment_indices % ep_size
+    local_experts = (assignment_indices // ep_size) % local_experts_per_rank
+    balanced_experts = dst_ranks * local_experts_per_rank + local_experts
     values = tl.where(
         valid_row,
         balanced_experts.to(tl.int32),
@@ -153,12 +160,25 @@ def _router_force_balance_topk_ids_kernel(
     )
 
 
+def _resolve_force_balance_global_token_start(
+    num_tokens: int,
+    ep_rank: int,
+    global_token_start: Optional[int],
+) -> int:
+    if global_token_start is not None:
+        return global_token_start
+
+    # Fallback for paths without DP-global token offsets.
+    return ep_rank * num_tokens
+
+
 def _build_force_balanced_topk_ids(
     template_topk_ids: torch.Tensor,
     *,
     num_experts: int,
     ep_rank: int,
     ep_size: int,
+    global_token_start: Optional[int],
 ) -> torch.Tensor:
     num_tokens, topk = template_topk_ids.shape
     forced_topk_ids = torch.empty(
@@ -167,8 +187,12 @@ def _build_force_balanced_topk_ids(
     if num_tokens == 0 or topk == 0:
         return forced_topk_ids
 
-    rank_slot_offset = ep_rank * topk
-    global_token_stride = ep_size * topk
+    local_experts_per_rank = num_experts // ep_size
+    global_token_start = _resolve_force_balance_global_token_start(
+        num_tokens=num_tokens,
+        ep_rank=ep_rank,
+        global_token_start=global_token_start,
+    )
 
     if template_topk_ids.device.type == "cuda":
         block_size = min(triton.next_power_of_2(topk), 1024)
@@ -180,8 +204,9 @@ def _build_force_balanced_topk_ids(
             template_topk_ids.stride(0),
             forced_topk_ids.stride(0),
             num_experts,
-            rank_slot_offset,
-            global_token_stride,
+            ep_size,
+            local_experts_per_rank,
+            global_token_start,
             BLOCK_SIZE=block_size,
             num_warps=1,
             num_stages=1,
@@ -192,10 +217,15 @@ def _build_force_balanced_topk_ids(
     row_base = torch.arange(
         num_tokens, device=template_topk_ids.device, dtype=torch.int64
     )
-    row_base.mul_(global_token_stride).add_(rank_slot_offset)
+    row_base.add_(global_token_start)
     slot_offsets = torch.arange(topk, device=template_topk_ids.device, dtype=torch.int64)
+    assignment_indices = row_base.unsqueeze(1).mul(topk).add(slot_offsets)
+    dst_ranks = assignment_indices.remainder(ep_size)
+    local_experts = assignment_indices.div(ep_size, rounding_mode="floor").remainder(
+        local_experts_per_rank
+    )
     forced_topk_ids.copy_(
-        ((row_base.unsqueeze(1) + slot_offsets) % num_experts).to(torch.int32)
+        (dst_ranks * local_experts_per_rank + local_experts).to(torch.int32)
     )
     forced_topk_ids.masked_fill_(~valid_rows.unsqueeze(1), -1)
     return forced_topk_ids
@@ -210,6 +240,7 @@ class DeepEPMoE(FusedMoE):
     _has_printed = False
     _has_logged_router_force_balance = False
     _has_logged_router_force_balance_unsupported = False
+    _has_logged_router_force_balance_nonuniform_ep = False
 
     def __init__(
         self,
@@ -282,7 +313,8 @@ class DeepEPMoE(FusedMoE):
         ):
             logger.warning(
                 "SGLANG_ROUTER_FORCE_BALANCE is enabled. Router logits/top-k are still computed, "
-                "but routed expert IDs will be overwritten with a deterministic balanced pattern."
+                "but prefill routed expert IDs will be overwritten with a deterministic rank-first "
+                "balanced pattern while decode keeps the original router assignments."
             )
             DeepEPMoE._has_logged_router_force_balance = True
 
@@ -429,6 +461,9 @@ class DeepEPMoE(FusedMoE):
         if not self.router_force_balance_enabled:
             return topk_output
 
+        if not get_is_extend_in_batch():
+            return topk_output
+
         if not TopKOutputChecker.format_is_standard(topk_output):
             if not DeepEPMoE._has_logged_router_force_balance_unsupported:
                 logger.warning(
@@ -444,11 +479,22 @@ class DeepEPMoE(FusedMoE):
             and topk_output.router_logits.ndim >= 2
             else self.num_experts - self.num_fused_shared_experts
         )
+        if routed_num_experts % self.moe_ep_size != 0:
+            if not DeepEPMoE._has_logged_router_force_balance_nonuniform_ep:
+                logger.warning(
+                    "SGLANG_ROUTER_FORCE_BALANCE rank-first mapping requires "
+                    "num_experts divisible by ep_size. Falling back to the original "
+                    "router assignments."
+                )
+                DeepEPMoE._has_logged_router_force_balance_nonuniform_ep = True
+            return topk_output
+
         forced_topk_ids = _build_force_balanced_topk_ids(
             topk_output.topk_ids,
             num_experts=routed_num_experts,
             ep_rank=self.moe_ep_rank,
             ep_size=self.moe_ep_size,
+            global_token_start=get_force_balance_global_token_start(),
         )
         return StandardTopKOutput(
             topk_weights=topk_output.topk_weights,
@@ -469,7 +515,7 @@ class DeepEPMoE(FusedMoE):
             )
 
         # Keep router compute in the profile, but overwrite the selected experts
-        # with a deterministic balanced pattern for benchmark-focused runs.
+        # during prefill with a deterministic balanced pattern for benchmarking.
         topk_output = self._maybe_force_balance_topk(topk_output)
 
         if self.ultra_ep_enabled:
